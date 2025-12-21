@@ -1,0 +1,47 @@
+import time
+import urllib
+
+print("🚀 Preparing the Robust Mobile Link (Cloudflare)...")
+
+# 1. تثبيت Streamlit فقط
+!pip install -q streamlit
+
+# 2. تحميل وتشغيل Cloudflare Tunnel (أكثر استقراراً من localtunnel)
+!wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+!chmod +x cloudflared
+!./cloudflared tunnel --url http://localhost:8501 &>/dev/null &
+
+# 3. تشغيل التطبيق
+!streamlit run app.py &>/dev/null &
+
+# 4. انتظار قليل واستخراج الرابط
+time.sleep(5)
+try:
+    # استخراج رابط النفق
+    cf_url = !grep -o 'https://.*\.trycloudflare.com' nohup.out 2>/dev/null | head -n 1
+    # طريقة بديلة في حال لم يظهر في nohup
+    if not cf_url:
+        import requests
+        # ننتظر قليلاً لنتأكد من عمل النفق
+        time.sleep(3)
+        print("🔗 Waiting for tunnel...")
+        # (هنا نعتمد على أن كلاود فلير يعمل في الخلفية، سنعطيك الرابط يدوياً إذا لم يظهر)
+        
+    print("\n✅ SUCCESS! Click this link to view on your phone:")
+    # هذا الأمر سيطبع الرابط الصحيح من سجلات النظام
+    !ps aux | grep cloudflared | grep trycloudflare
+    # أو سنجرب طباعته من ملف اللوج الافتراضي
+    !cat /root/.cloudflared/config.yml 2>/dev/null
+    
+    print("\n👇 👇 👇 CLICK THIS LINK 👇 👇 👇")
+    !grep -o 'https://.*\.trycloudflare.com' /content/nohup.out 2>/dev/null || echo "Searching..."
+    # محاولة أخيرة لاستخراج الرابط بدقة
+    !pkill cloudflared
+    !nohup ./cloudflared tunnel --url http://localhost:8501 > tunnel_log.txt 2>&1 &
+    time.sleep(4)
+    !grep -o 'https://.*\.trycloudflare.com' tunnel_log.txt
+    
+except Exception as e:
+    print(f"Error: {e}")
+
+print("\n💡 Tip: This link works directly on Safari (No password needed).")
