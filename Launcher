@@ -1,0 +1,16 @@
+# 1. تثبيت المكتبات
+!pip install -q streamlit
+!wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+!chmod +x cloudflared
+
+# 2. تشغيل النفق (Cloudflare Tunnel)
+import time
+!nohup ./cloudflared tunnel --url http://localhost:8501 > nohup.out 2>&1 &
+
+# 3. تشغيل التطبيق (في الخلفية)
+!nohup streamlit run app.py > streamlit.out 2>&1 &
+
+# 4. طباعة الرابط
+time.sleep(5)
+print("\n👇 CLICK THIS LINK TO OPEN APP 👇")
+!grep -o 'https://.*\.trycloudflare.com' nohup.out 2>/dev/null | head -n 1
