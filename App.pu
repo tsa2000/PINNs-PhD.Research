@@ -1,0 +1,165 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+import numpy as np
+import plotly.graph_objs as go
+import re
+
+# --- Page Config ---
+st.set_page_config(page_title="18650 Digital Twin Agent", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""<style>.block-container {padding-top: 1rem; padding-bottom: 5rem;} .stChatInput {position: fixed; bottom: 0; left: 0; right: 0; padding: 1rem; background: white; z-index: 100;}</style>""", unsafe_allow_html=True)
+
+# --- Model Definition (Must match training) ---
+class BatteryPINN_Uncertainty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), nn.Tanh(),
+            nn.Dropout(0.05),  
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+    def forward(self, t, v):
+        TIME_SCALE, T_SCALE, V_SCALE = 60.0, 1000.0, 200.0
+        inputs = torch.cat([t/TIME_SCALE, v/V_SCALE], dim=1)
+        return self.net(inputs) * T_SCALE
+
+# --- Load Model ---
+@st.cache_resource
+def load_model():
+    model = BatteryPINN_Uncertainty()
+    try:
+        model.load_state_dict(torch.load("battery_pinn_uncertainty.pth", map_location=torch.device('cpu')))
+        model.eval()
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+    return model
+
+# --- Dynamic Simulation Engine ---
+def run_dynamic_simulation(model, velocity_profile, duration, n_samples=50):
+    t_vals = np.linspace(0, duration, len(velocity_profile))
+    t_tensor = torch.tensor(t_vals, dtype=torch.float32).view(-1, 1)
+    v_tensor = torch.tensor(velocity_profile, dtype=torch.float32).view(-1, 1)
+    
+    model.train() # Enable Dropout
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            preds.append(model(t_tensor, v_tensor).numpy().flatten())
+    preds = np.array(preds)
+    return t_vals, preds.mean(axis=0), preds.std(axis=0)
+
+# --- AI Agent Logic ---
+def creative_agent(query, model):
+    query = query.lower()
+    points = 300
+    
+    # Time Parsing
+    duration = 60.0 
+    time_min_match = re.search(r'(\d+)\s*(min|minutes)', query)
+    time_sec_match = re.search(r'(\d+)\s*(s|sec|seconds)', query)
+    
+    time_str = "60s (Default)"
+    if time_min_match:
+        mins = float(time_min_match.group(1))
+        duration = mins * 60.0
+        time_str = f"{mins} minutes ({duration:.0f}s)"
+    elif time_sec_match:
+        secs = float(time_sec_match.group(1))
+        duration = secs
+        time_str = f"{secs} seconds"
+
+    t_base = np.linspace(0, duration, points)
+    velocity_profile = None
+    scenario_name = ""
+    explanation = ""
+
+    if "panic" in query or "stop" in query:
+        scenario_name = "⚠️ Scenario: Panic Stop"
+        stop_time = duration / 3.0
+        velocity_profile = np.ones(points) * 120.0 
+        velocity_profile[t_base > stop_time] = 0.0 
+        explanation = f"Simulating **Panic Stop** over **{time_str}**. Velocity drops to 0 at t={stop_time:.1f}s."
+
+    elif "rescue" in query or "accelerate" in query:
+        scenario_name = "✅ Scenario: Aero-Cooling Rescue"
+        start_time = duration / 4.0
+        velocity_profile = np.zeros(points)
+        velocity_profile[t_base > start_time] = 180.0 
+        explanation = f"Simulating **Rescue Acceleration** over **{time_str}**. Forced convection starts at t={start_time:.1f}s."
+
+    else:
+        # Extract Velocity
+        numbers = re.findall(r'(\d+)', query)
+        velocity = 0.0
+        vel_specific = re.search(r'(\d+)\s*(km|km/h)', query)
+        
+        if vel_specific:
+            velocity = float(vel_specific.group(1))
+        elif len(numbers) > 0:
+            for num in numbers:
+                if float(num) != (duration/60.0 if "min" in query else duration):
+                    velocity = float(num)
+                    break
+            if velocity == 0 and len(numbers)==1 and "min" not in query: velocity = float(numbers[0])
+
+        if velocity > 0 or "0 km" in query:
+            scenario_name = f"🚗 Constant Velocity: {velocity} km/h"
+            velocity_profile = np.full(points, velocity)
+            explanation = f"Simulating cruising at **{velocity} km/h** for **{time_str}**."
+        else:
+             return "I understood the time, but not the speed. Try: '100 km/h for 10 minutes'.", None, None, None, None, None
+
+    t, mean, std = run_dynamic_simulation(model, velocity_profile, duration)
+    return explanation, t, mean, std, velocity_profile, scenario_name
+
+# --- Main Interface ---
+st.title("🔋 18650 Digital Twin Agent")
+st.caption("PhD Demonstrator | PINN + Uncertainty Quantification")
+
+model = load_model()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "figure" in msg:
+            st.plotly_chart(msg["figure"], use_container_width=True)
+
+if prompt := st.chat_input("Ask: 'Panic stop', 'Rescue', or '100 km/h for 10 min'"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Running Physics Simulation..."):
+            explanation, t, mean, std, v_profile, title = creative_agent(prompt, model)
+            
+            if t is not None:
+                st.markdown(f"**{title}**")
+                st.markdown(explanation)
+                
+                fig = go.Figure()
+                # Uncertainty
+                fig.add_trace(go.Scatter(
+                    x=np.concatenate([t, t[::-1]]),
+                    y=np.concatenate([mean+2*std, (mean-2*std)[::-1]]),
+                    fill='toself', fillcolor='rgba(255,0,0,0.2)', line=dict(color='rgba(255,255,255,0)'), name='Uncertainty'
+                ))
+                # Temperature
+                fig.add_trace(go.Scatter(x=t, y=mean, name='Temperature', line=dict(color='red', width=3)))
+                # Velocity Profile
+                fig.add_trace(go.Scatter(x=t, y=v_profile, name='Velocity', line=dict(color='blue', dash='dot'), yaxis='y2'))
+                
+                fig.update_layout(height=400, margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", y=1.1),
+                                  yaxis=dict(title="Temp (°C)"), yaxis2=dict(title="Vel (km/h)", overlaying='y', side='right', range=[0, 250]))
+                
+                st.plotly_chart(fig, use_container_width=True)
+                st.session_state.messages.append({"role": "assistant", "content": explanation, "figure": fig})
+            else:
+                st.markdown(explanation)
+                st.session_state.messages.append({"role": "assistant", "content": explanation})
