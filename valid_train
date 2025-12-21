@@ -1,0 +1,60 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+# ==========================================
+# 1. دالة التوقع (مع تفعيل عدم اليقين)
+# ==========================================
+def get_prediction_stats(model, t, v_val, n_samples=100):
+    # تجهيز التنسور
+    t_tensor = t.view(-1, 1)
+    v_tensor = torch.full_like(t_tensor, float(v_val))
+    
+    model.train() # تفعيل الـ Dropout (سر الخدعة)
+    preds = []
+    
+    with torch.no_grad():
+        for _ in range(n_samples):
+            pred = model(t_tensor, v_tensor).numpy().flatten()
+            preds.append(pred)
+    
+    preds = np.array(preds)
+    mean = preds.mean(axis=0)
+    std = preds.std(axis=0)
+    model.eval()
+    return mean, std
+
+# ==========================================
+# 2. تشغيل الفحص على سرعات متعددة
+# ==========================================
+velocities = [0, 50, 100, 200]
+colors = ['red', 'orange', 'green', 'purple']
+t_vals = torch.linspace(0, 60, 200)
+
+plt.figure(figsize=(12, 7))
+
+print(f"{'Speed (km/h)':<15} | {'Peak Temp (°C)':<15} | {'Uncertainty (±)'}")
+print("-" * 50)
+
+for v, color in zip(velocities, colors):
+    mean, std = get_prediction_stats(model, t_vals, v, n_samples=50)
+    
+    # رسم الخط المتوسط
+    plt.plot(t_vals, mean, color=color, linewidth=2, label=f'{v} km/h')
+    
+    # رسم منطقة عدم اليقين
+    plt.fill_between(t_vals, mean - 2*std, mean + 2*std, color=color, alpha=0.15)
+    
+    # طباعة تقرير رقمي
+    peak_idx = np.argmax(mean)
+    print(f"{v:<15} | {mean[peak_idx]:.2f}          | ± {2*std[peak_idx]:.2f}")
+
+print("-" * 50)
+
+# تنسيق الرسم
+plt.title("Robustness Check: Uncertainty & Cooling across Velocities")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
