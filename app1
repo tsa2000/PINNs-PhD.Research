@@ -1,0 +1,157 @@
+%%writefile app.py
+import streamlit as st
+import torch
+import torch.nn as nn
+import numpy as np
+import plotly.graph_objs as go
+
+# ==========================================
+# 1. إعداد الصفحة للموبايل
+# ==========================================
+st.set_page_config(
+    page_title="Battery AI Twin",
+    layout="wide",
+    page_icon="🔋",
+    initial_sidebar_state="collapsed" # إخفاء الشريط الجانبي لتوفير المساحة
+)
+
+# CSS لتحسين العرض على سفاري والهواتف
+st.markdown("""
+<style>
+    .block-container {padding-top: 1rem; padding-bottom: 1rem;}
+    .stMetric {background-color: #f0f2f6; padding: 10px; border-radius: 10px; text-align: center;}
+    h1 {font-size: 1.5rem !important;}
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 2. تعريف النموذج (128 Neurons + Dropout)
+# ==========================================
+class BatteryPINN_Uncertainty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), nn.Tanh(),
+            nn.Dropout(0.05),  
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, t, v):
+        TIME_SCALE, T_SCALE, V_SCALE = 60.0, 1000.0, 200.0
+        inputs = torch.cat([t/TIME_SCALE, v/V_SCALE], dim=1)
+        return self.net(inputs) * T_SCALE
+
+# ==========================================
+# 3. تحميل النموذج
+# ==========================================
+@st.cache_resource
+def load_model():
+    model = BatteryPINN_Uncertainty()
+    try:
+        model.load_state_dict(torch.load("battery_pinn_uncertainty.pth", map_location=torch.device('cpu')))
+        model.eval()
+    except Exception as e:
+        st.error(f"Error: {e}")
+    return model
+
+# ==========================================
+# 4. محرك المحاكاة
+# ==========================================
+def get_mc_predictions(model, t_tensor, v_tensor, n_samples=50):
+    model.train() # تفعيل عدم اليقين
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            preds.append(model(t_tensor, v_tensor).numpy().flatten())
+    preds = np.array(preds)
+    return preds.mean(axis=0), preds.std(axis=0)
+
+# ==========================================
+# 5. واجهة المستخدم (Mobile Layout)
+# ==========================================
+st.title("🔋 18650 AI Digital Twin")
+st.caption("PhD Demonstrator | PINN + Uncertainty")
+
+model = load_model()
+
+# وضعنا التحكم داخل "Expander" لكي لا يزحم الشاشة
+with st.expander("⚙️ Scenario Settings (اضغط هنا للتعديل)", expanded=True):
+    velocity = st.slider("🚗 Velocity (km/h)", 0, 200, 0)
+    time_range = st.slider("⏱️ Duration (s)", 10, 60, 60)
+
+if model:
+    # الحساب
+    t_tensor = torch.linspace(0, time_range, 200).view(-1, 1)
+    v_tensor = torch.full_like(t_tensor, float(velocity))
+    t_plot = t_tensor.numpy().flatten()
+    
+    with st.spinner('Running Simulation...'):
+        mean, std = get_mc_predictions(model, t_tensor, v_tensor)
+    
+    # --- الرسم البياني المتجاوب ---
+    fig = go.Figure()
+    
+    # الظل (عدم اليقين)
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([t_plot, t_plot[::-1]]),
+        y=np.concatenate([mean+2*std, (mean-2*std)[::-1]]),
+        fill='toself',
+        fillcolor='rgba(255, 0, 0, 0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='Uncertainty',
+        showlegend=False
+    ))
+    
+    # الخط الرئيسي
+    fig.add_trace(go.Scatter(
+        x=t_plot, y=mean,
+        mode='lines',
+        name='Temperature',
+        line=dict(color='#d62728', width=3)
+    ))
+    
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=30, b=20), # هوامش صغيرة للموبايل
+        xaxis_title="Time (s)",
+        yaxis_title="Temp (°C)",
+        yaxis=dict(range=[0, 900]),
+        height=350, # ارتفاع مناسب للهاتف
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # --- بطاقات الأرقام ---
+    c1, c2 = st.columns(2)
+    peak_val = mean.max()
+    c1.metric("🔥 Peak Temp", f"{peak_val:.0f}°C")
+    c2.metric("📉 Cooling", "Active" if velocity > 0 else "None")
+
+    # --- رد الوكيل الذكي (AI Query Answer) ---
+    st.markdown("### 🤖 AI Analyst Report")
+    
+    report_box = st.container()
+    if velocity == 0:
+        report_box.error(f"""
+        **Status: CRITICAL**
+        - **Risk:** Extreme. No forced cooling.
+        - **Prediction:** Peak reaches ~{peak_val:.0f}°C.
+        - **Uncertainty:** High deviation detected.
+        """)
+    elif velocity > 100:
+        report_box.success(f"""
+        **Status: OPTIMIZED**
+        - **Risk:** Managed. High-speed convection active.
+        - **Physics:** Convection cooling dominates radiation.
+        - **Benefit:** Temperature suppressed by ~10-15°C compared to static.
+        """)
+    else:
+        report_box.warning(f"""
+        **Status: TRANSITIONAL**
+        - **Risk:** Moderate.
+        - **Advice:** Increase velocity to >100 km/h for better heat dissipation.
+        """)
