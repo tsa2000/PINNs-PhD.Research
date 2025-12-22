@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import copy
+import matplotlib.pyplot as plt
+
+# 1. تثبيت العشوائية
+torch.manual_seed(42)
+np.random.seed(42)
+
+# 2. الثوابت
+M, CP, A = 0.042, 800.0, 0.004185
+T_INF, H_BASELINE = 23.0, 5.0
+SIGMA, EPSILON = 5.67e-8, 0.85
+TIME_SCALE, T_SCALE, V_SCALE = 60.0, 1000.0, 200.0
+
+# 3. الدوال الفيزيائية
+def get_q_tr(t):
+    q_peak = 11040.0
+    val = torch.zeros_like(t)
+    mask1 = (t < 1.0) & (t >= 0.0)
+    val[mask1] = q_peak * t[mask1]
+    mask2 = (t >= 1.0) & (t <= 6.0)
+    val[mask2] = q_peak * (1.0 - (t[mask2] - 1.0) / 5.0)
+    return val
+
+def get_h(v_kmh):
+    v_ms = torch.abs(v_kmh) / 3.6
+    h_forced = 5.0 + 4.0 * (v_ms ** 0.8)
+    return torch.clamp(h_forced, min=H_BASELINE)
+
+# 4. الشبكة المحسنة (Heavy-Duty)
+class BatteryPINN_Uncertainty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            # زدنا العرض إلى 128 لاستيعاب الضجيج
+            nn.Linear(2, 128), nn.Tanh(),
+            nn.Dropout(0.05),  # قللنا النسبة إلى 5% فقط
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, t, v):
+        inputs = torch.cat([t/TIME_SCALE, v/V_SCALE], dim=1)
+        return self.net(inputs) * T_SCALE
+
+# 5. دالة الخسارة
+def physics_loss(model, t, v):
+    t.requires_grad = True
+    T_pred = model(t, v)
+    dTdt = torch.autograd.grad(T_pred, t, grad_outputs=torch.ones_like(T_pred), create_graph=True)[0]
+
+    Q_gen, h_val = get_q_tr(t), get_h(v)
+    Q_conv = h_val * A * (T_pred - T_INF)
+    Q_rad = EPSILON * SIGMA * A * ((T_pred+273.15)**4 - (T_INF+273.15)**4)
+
+    residual = (M * CP * dTdt) - (Q_gen - Q_conv - Q_rad)
+    return torch.mean((residual / (M*CP))**2)
+
+# 6. التدريب المكثف
+model = BatteryPINN_Uncertainty()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500)
+
+loss_weight_ic = 100.0
+best_loss = float('inf')
+best_model_state = None
+
+print("🚀 Starting Heavy-Duty Uncertainty Training...")
+
+for epoch in range(8001): # زدنا الدورات قليلاً لضمان الدقة
+    optimizer.zero_grad()
+
+    # تركيز شديد على منطقة الانفجار (70% من النقاط)
+    t_event = torch.rand(1400, 1) * 10.0
+    v_event = torch.rand(1400, 1) * 200.0
+
+    t_cool = 10.0 + torch.rand(600, 1) * 50.0
+    v_cool = torch.rand(600, 1) * 200.0
+
+    t_phy = torch.cat([t_event, t_cool], dim=0)
+    v_phy = torch.cat([v_event, v_cool], dim=0)
+
+    loss_phy = physics_loss(model, t_phy, v_phy)
+
+    # IC
+    t_ic = torch.zeros(500, 1)
+    v_ic = torch.rand(500, 1) * 200.0
+    loss_ic = torch.mean((model(t_ic, v_ic) - T_INF)**2)
+
+    total_loss = loss_phy + loss_weight_ic * loss_ic
+    total_loss.backward()
+    optimizer.step()
+    scheduler.step(total_loss)
+
+    if total_loss.item() < best_loss:
+        best_loss = total_loss.item()
+        best_model_state = copy.deepcopy(model.state_dict())
+
+    if epoch % 1000 == 0:
+        print(f"Epoch {epoch}: Loss {total_loss.item():.5f} | Best: {best_loss:.5f}")
+
+print("✅ Training Complete.")
+model.load_state_dict(best_model_state)
+torch.save(model.state_dict(), "battery_pinn_uncertainty.pth")
+
+# ==========================================
+# الرسم المباشر للتحقق (Auto-Plot)
+# ==========================================
+def predict_with_uncertainty(model, t, v, n_samples=100):
+    model.train()
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            preds.append(model(t, v).numpy().flatten())
+    preds = np.array(preds)
+    return preds.mean(axis=0), preds.std(axis=0)
+
+t_vals = torch.linspace(0, 60, 200).view(-1, 1)
+v_vals = torch.zeros_like(t_vals)
+mean, std = predict_with_uncertainty(model, t_vals, v_vals)
+
+plt.figure(figsize=(10, 6))
+plt.plot(t_vals, mean, 'r-', linewidth=2, label='Mean Prediction')
+plt.fill_between(t_vals.flatten(), mean - 2*std, mean + 2*std, color='red', alpha=0.3, label='95% CI')
+plt.title(f"Uncertainty Check (Peak: {mean.max():.1f}°C)")
+plt.xlabel("Time (s)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
