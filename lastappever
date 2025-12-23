@@ -1,0 +1,314 @@
+import os
+import time
+
+# ==========================================
+# 1. تنظيف البيئة
+# ==========================================
+!pkill cloudflared
+!pkill streamlit
+!rm -f nohup.out app.py
+
+# ==========================================
+# 2. كتابة التطبيق (النسخة النظيفة - No Warnings)
+# ==========================================
+app_code = """
+import streamlit as st
+import torch
+import torch.nn as nn
+import numpy as np
+import plotly.graph_objs as go
+import re
+
+# --- إعداد الصفحة ---
+st.set_page_config(page_title="Ultimate Digital Twin", layout="wide", page_icon="🔋")
+
+# --- تنسيق CSS احترافي ---
+st.markdown(\"\"\"
+<style>
+    .block-container {padding-top: 2rem;}
+    .stMetric {background-color: #f0f2f6; padding: 10px; border-radius: 10px;}
+</style>
+\"\"\", unsafe_allow_html=True)
+
+# ==========================================
+# 1. الفيزياء والثوابت (Physics Core)
+# ==========================================
+M, CP, A = 0.042, 800.0, 0.004185
+T_INF = 23.0
+TIME_SCALE, T_SCALE, V_SCALE = 60.0, 1000.0, 200.0
+SIGMA, EPSILON = 5.67e-8, 0.85
+
+def get_h(v_kmh):
+    v_ms = abs(v_kmh) / 3.6
+    h_forced = 5.0 + 4.0 * (v_ms ** 0.8)
+    return h_forced if h_forced > 5.0 else 5.0
+
+# دالة توليد الحرارة (للتحقق من الطاقة)
+def get_q_tr(t_tensor):
+    q_peak = 11040.0
+    val = torch.zeros_like(t_tensor)
+    mask1 = (t_tensor < 1.0) & (t_tensor >= 0.0)
+    val[mask1] = q_peak * t_tensor[mask1]
+    mask2 = (t_tensor >= 1.0) & (t_tensor <= 6.0)
+    val[mask2] = q_peak * (1.0 - (t_tensor[mask2] - 1.0) / 5.0)
+    return val
+
+# ==========================================
+# 2. نموذج الذكاء الاصطناعي (PINN)
+# ==========================================
+class BatteryPINN_Uncertainty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+    def forward(self, t, v):
+        inputs = torch.cat([t/TIME_SCALE, v/V_SCALE], dim=1)
+        return self.net(inputs) * T_SCALE
+
+@st.cache_resource
+def load_model():
+    model = BatteryPINN_Uncertainty()
+    try:
+        model.load_state_dict(torch.load("battery_pinn_uncertainty.pth", map_location=torch.device('cpu')))
+        model.eval()
+    except:
+        pass 
+    return model
+
+# ==========================================
+# 3. المتحكم الهجين (Hybrid Brain) 🧠
+# ==========================================
+class HybridController:
+    def __init__(self, ai_model, t_threshold=60.0):
+        self.ai_model = ai_model
+        self.t_threshold = t_threshold
+
+    def classical_step(self, T_curr, v_val, dt, amb_temp=T_INF):
+        h_val = get_h(v_val)
+        Q_conv = h_val * A * (T_curr - amb_temp)
+        Q_rad = EPSILON * SIGMA * A * ((T_curr + 273.15)**4 - (amb_temp + 273.15)**4)
+        dTdt = -(Q_conv + Q_rad) / (M * CP)
+        return T_curr + dTdt * dt
+
+    def solve_trajectory(self, duration_sec, v_kmh, amb_temp=23.0):
+        # 1. مرحلة الذكاء الاصطناعي (أول 60 ثانية)
+        t_ai_limit = min(duration_sec, self.t_threshold)
+        points_ai = int(t_ai_limit * 2) if t_ai_limit > 0 else 10
+        t_ai = torch.linspace(0, t_ai_limit, points_ai).view(-1, 1)
+        v_in = torch.full_like(t_ai, v_kmh)
+        
+        self.ai_model.eval()
+        with torch.no_grad():
+            T_ai = self.ai_model(t_ai, v_in).numpy().flatten()
+        
+        T_ai_adjusted = T_ai + (amb_temp - 23.0)
+        
+        if duration_sec <= self.t_threshold:
+            return t_ai.flatten().numpy(), T_ai_adjusted
+
+        # 2. مرحلة الفيزياء (بعد 60 ثانية)
+        t_phy = []
+        T_phy = []
+        curr_t = t_ai_limit
+        curr_T = T_ai_adjusted[-1]
+        dt = 1.0 # دقة ثانية واحدة
+        
+        while curr_t < duration_sec:
+            curr_t += dt
+            curr_T = self.classical_step(curr_T, v_kmh, dt, amb_temp)
+            t_phy.append(curr_t)
+            T_phy.append(curr_T)
+            
+        return np.concatenate([t_ai.flatten().numpy(), t_phy]), np.concatenate([T_ai_adjusted, T_phy])
+
+# ==========================================
+# 4. معالج اللغة (NLP Parser)
+# ==========================================
+def parse_and_simulate(query, agent):
+    query = query.lower()
+    
+    # استخراج الزمن (تم إصلاح التحذير هنا باستخدام backslashes مزدوجة)
+    duration = 60.0 
+    time_str = "60s"
+    min_match = re.search(r'(\\d+)\\s*(min|minutes)', query)
+    sec_match = re.search(r'(\\d+)\\s*(s|sec|seconds)', query)
+    
+    if min_match:
+        mins = float(min_match.group(1))
+        duration = mins * 60.0
+        time_str = f"{mins} min"
+    elif sec_match:
+        secs = float(sec_match.group(1))
+        duration = secs
+        time_str = f"{secs} sec"
+        
+    # استخراج السرعة
+    velocity = 0.0
+    vel_str = "0 km/h (Static)"
+    vel_match = re.search(r'(\\d+)\\s*(km|km/h|kph)', query)
+    if vel_match:
+        velocity = float(vel_match.group(1))
+        vel_str = f"{velocity} km/h"
+        
+    # استخراج الحرارة (إضافي)
+    amb_temp = 23.0
+    if "winter" in query or "cold" in query: amb_temp = -10.0
+    elif "desert" in query or "hot" in query: amb_temp = 45.0
+        
+    # التشغيل
+    t_vals, T_vals = agent.solve_trajectory(duration, velocity, amb_temp)
+    
+    return t_vals, T_vals, velocity, amb_temp, time_str, vel_str
+
+# ==========================================
+# 5. واجهة المستخدم الرئيسية
+# ==========================================
+st.title("🔋 Ultimate Digital Twin: AI + Physics")
+st.markdown("**Interactive PhD Demonstrator**")
+
+model = load_model()
+agent = HybridController(model)
+
+# التبويبات الثلاثة
+tab1, tab2, tab3 = st.tabs(["💬 Chat Agent", "🧪 Scenarios Lab", "⚖️ Validation Room"])
+
+# --- Tab 1: المساعد الذكي ---
+with tab1:
+    st.markdown("#### 🤖 Ask the Digital Twin")
+    st.caption("Try: 'What happens at 20 km/h for 10 minutes?' or 'Simulate 5 mins in winter'")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if "figure" in msg:
+                st.plotly_chart(msg["figure"], use_container_width=True)
+
+    if prompt := st.chat_input("Enter your query..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            t_sim, T_sim, vel, amb, t_str, v_str = parse_and_simulate(prompt, agent)
+            
+            final_temp = T_sim[-1]
+            status = "✅ SAFE" if final_temp < 60 else "⚠️ WARNING"
+            
+            response_text = f"**Simulation Config:** {v_str} for {t_str} @ {amb}°C\\n"
+            response_text += f"**Prediction:** At t={t_str}, Temp = **{final_temp:.2f}°C** {status}"
+            
+            st.markdown(response_text)
+            
+            # الرسم البياني
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=t_sim/60, y=T_sim, mode='lines', name='Temperature', line=dict(color='#FF4B4B', width=3)))
+            
+            # إضافة نقطة النهاية
+            fig.add_trace(go.Scatter(x=[t_sim[-1]/60], y=[final_temp], mode='markers+text', 
+                                     marker=dict(size=12, color='black'),
+                                     text=[f"{final_temp:.1f}°C"], textposition="top center", name="Final Point"))
+
+            if t_sim[-1] > 60:
+                fig.add_vline(x=1.0, line_dash="dash", annotation_text="AI → Physics Handover")
+                
+            fig.update_layout(xaxis_title="Time (Minutes)", yaxis_title="Temperature (°C)", height=350, margin=dict(t=20, b=20))
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.session_state.messages.append({"role": "assistant", "content": response_text, "figure": fig})
+
+# --- Tab 2: مختبر السيناريوهات ---
+with tab2:
+    st.markdown("#### 🌍 Pre-defined Complex Scenarios")
+    
+    col1, col2, col3 = st.columns(3)
+    if col1.button("🌵 Desert Parking (Worst Case)"):
+        t, T = agent.solve_trajectory(20*60, 0.0, 45.0)
+        st.error(f"Desert Result: {T[-1]:.1f}°C (Heat Trapped)")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t/60, y=T, line=dict(color='red')))
+        st.plotly_chart(fig)
+        
+    if col2.button("❄️ Winter Drive (Best Case)"):
+        t, T = agent.solve_trajectory(15*60, 100.0, -10.0)
+        st.info(f"Winter Result: {T[-1]:.1f}°C (Rapid Cooling)")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t/60, y=T, line=dict(color='cyan')))
+        st.plotly_chart(fig)
+
+    if col3.button("🛣️ Highway Breakdown"):
+        # محاكاة مركبة (يدوي)
+        t1, T1 = agent.solve_trajectory(5*60, 120.0, 25.0) # مشي
+        # وقوف مفاجئ (نبدأ من حيث انتهينا)
+        agent_static = HybridController(model)
+        curr_T = T1[-1]
+        T2 = []
+        t2 = []
+        curr_t = t1[-1]
+        for _ in range(25*60): # 25 دقيقة
+            curr_t += 1.0
+            curr_T = agent_static.classical_step(curr_T, 0.0, 1.0, 25.0)
+            t2.append(curr_t)
+            T2.append(curr_T)
+        
+        full_t = np.concatenate([t1, np.array(t2)])
+        full_T = np.concatenate([T1, np.array(T2)])
+        
+        st.warning(f"Breakdown Result: Heat Soak Effect detected.")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=full_t/60, y=full_T, line=dict(color='orange')))
+        fig.add_vline(x=5.0, line_dash="dot", annotation_text="Breakdown Event")
+        st.plotly_chart(fig)
+
+# --- Tab 3: غرفة التحقق (Validation) ---
+with tab3:
+    st.markdown("#### ✅ Physics Verification Suite")
+    
+    # 1. Energy Check
+    st.markdown("**1. Energy Conservation Check**")
+    t_check = torch.linspace(0, 10, 1000)
+    q_check = get_q_tr(t_check)
+    energy_input = torch.trapz(q_check, t_check).item()
+    col_v1, col_v2 = st.columns(2)
+    col_v1.metric("Integrated Heat Input", f"{energy_input/1000:.2f} kJ", "Target: ~32.2 kJ")
+    
+    # 2. Stability Check
+    st.markdown("**2. Long-Term Stability (AI vs Physics)**")
+    t_long, T_long = agent.solve_trajectory(3*3600, 0.0, 23.0) # 3 ساعات
+    final_drift = abs(T_long[-1] - 23.0)
+    col_v2.metric("Drift Error (3 Hours)", f"{final_drift:.4f} °C", "Target: < 0.1 °C")
+    
+    # الرسم البياني للتحقق
+    st.markdown("Logic Check: System must return to ambient temperature exactly.")
+    fig_v = go.Figure()
+    fig_v.add_trace(go.Scatter(x=t_long/3600, y=T_long, name='Hybrid Model'))
+    fig_v.add_hline(y=23.0, line_dash="dash", line_color="green", annotation_text="Ambient Target")
+    st.plotly_chart(fig_v)
+
+"""
+
+with open("app.py", "w") as f:
+    f.write(app_code)
+
+# ==========================================
+# تشغيل التطبيق والنفق
+# ==========================================
+import urllib
+!pip install -q streamlit pycloudflared plotly
+!wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+!chmod +x cloudflared
+!nohup ./cloudflared tunnel --url http://localhost:8501 > nohup.out 2>&1 &
+!nohup streamlit run app.py > streamlit.out 2>&1 &
+
+import time
+time.sleep(5)
+print("\n👇 CLICK HERE TO OPEN THE ULTIMATE DEMO 👇")
+!grep -o 'https://.*\.trycloudflare.com' nohup.out 2>/dev/null | head -n 1
