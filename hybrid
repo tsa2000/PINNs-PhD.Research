@@ -1,0 +1,60 @@
+def predict_hybrid(model, t_max_seconds, v_kmh=0.0):
+    """
+    Hybrid Solver: Uses PINN for the event (0-60s) and Classical Physics for long-term cooling.
+    """
+    # 1. المرحلة الأولى: الـ PINN (للانفجار 0-60 ثانية)
+    t_pinn_limit = 60.0
+    t_pinn = torch.linspace(0, t_pinn_limit, 200).view(-1, 1)
+    v_input = torch.full_like(t_pinn, v_kmh)
+
+    model.eval()
+    with torch.no_grad():
+        T_pinn = model(t_pinn, v_input).numpy().flatten()
+
+    # 2. المرحلة الثانية: الفيزياء التقليدية (للتبريد الطويل)
+    dt = 1.0  # خطوة زمنية
+    current_t = t_pinn_limit
+    current_T = T_pinn[-1]  # نبدأ من حيث انتهى الـ PINN
+
+    t_physics = []
+    T_physics = []
+
+    # تحويل السرعة (مع القيمة المطلقة للأمان)
+    v_ms = abs(v_kmh) / 3.6
+    h_val = 5.0 + 4.0 * (v_ms ** 0.8)
+    if h_val < 5.0: h_val = 5.0
+
+    while current_t < t_max_seconds:
+        current_t += dt
+
+        # المعادلة الفيزيائية للتبريد (Q_gen = 0 هنا)
+        Q_conv = h_val * A * (current_T - T_INF)
+        Q_rad = EPSILON * SIGMA * A * ((current_T + 273.15)**4 - (T_INF + 273.15)**4)
+
+        dTdt = -(Q_conv + Q_rad) / (M * CP)
+
+        current_T += dTdt * dt
+
+        t_physics.append(current_t)
+        T_physics.append(current_T)
+
+    # دمج البيانات
+    all_t = np.concatenate([t_pinn.flatten().numpy(), np.array(t_physics)])
+    all_T = np.concatenate([T_pinn, np.array(T_physics)])
+
+    return all_t, all_T
+
+# اختبار المحاكاة الهجينة لمدة 3 ساعات
+total_hours = 3
+t_sim, T_sim = predict_hybrid(best_model, t_max_seconds=3600*total_hours, v_kmh=0.0)
+
+plt.figure(figsize=(10, 6))
+plt.plot(t_sim/3600, T_sim, 'b-', linewidth=2, label='Hybrid Model (PINN + Physics)')
+plt.axhline(T_INF, color='r', linestyle='--', label=f'Ambient ({T_INF}°C)')
+plt.axvline(60/3600, color='k', linestyle=':', label='Handover (60s)')
+plt.title(f"Long-Term Simulation ({total_hours} Hours)\nFinal Temp: {T_sim[-1]:.2f}°C")
+plt.xlabel("Time (Hours)")
+plt.ylabel("Temperature (°C)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
