@@ -1,0 +1,31 @@
+import time
+import os
+
+print("🔄 Searching for the link...")
+
+# محاولة البحث عن الرابط لمدة 30 ثانية
+url_found = False
+for i in range(15):
+    # البحث داخل ملف السجل
+    if os.path.exists("nohup.out"):
+        with open("nohup.out", "r") as f:
+            content = f.read()
+            import re
+            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', content)
+            if match:
+                print("\n✅ LINK FOUND!")
+                print("👇👇👇👇👇👇👇👇")
+                print(match.group(0))
+                print("👆👆👆👆👆👆👆👆")
+                url_found = True
+                break
+    
+    time.sleep(2) # انتظار ثانيتين والمحاولة مرة أخرى
+
+if not url_found:
+    print("\n⚠️ Cloudflare is slow. Trying backup tunnel (LocalTunnel)...")
+    !npm install -g localtunnel > /dev/null 2>&1
+    !nohup npx localtunnel --port 8501 > lt.out 2>&1 &
+    time.sleep(5)
+    !grep -o 'https://.*\.loca\.lt' lt.out | head -n 1
+    print("(If using LocalTunnel, the password is usually the IP address of the Colab instance)")
