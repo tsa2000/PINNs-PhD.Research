@@ -1,0 +1,333 @@
+import os
+import time
+
+# ==========================================
+# 1. تنظيف البيئة
+# ==========================================
+!pkill cloudflared
+!pkill streamlit
+!rm -f nohup.out app.py
+
+# ==========================================
+# 2. كتابة التطبيق (مع الجداول ونسب الشك) 📊
+# ==========================================
+app_code = """
+import streamlit as st
+import torch
+import torch.nn as nn
+import numpy as np
+import plotly.graph_objs as go
+import pandas as pd
+import re
+
+# --- إعداد الصفحة ---
+st.set_page_config(page_title="Ultimate Digital Twin: Analytics", layout="wide", page_icon="🔋")
+
+st.markdown(\"\"\"
+<style>
+    .block-container {padding-top: 2rem;}
+    .stMetric {background-color: #f0f2f6; padding: 10px; border-radius: 10px;}
+    div[data-testid="stDataFrame"] {width: 100%;}
+</style>
+\"\"\", unsafe_allow_html=True)
+
+# ==========================================
+# 1. الثوابت والفيزياء
+# ==========================================
+M, CP, A = 0.042, 800.0, 0.004185
+T_INF = 23.0
+TIME_SCALE, T_SCALE, V_SCALE = 60.0, 1000.0, 200.0
+SIGMA, EPSILON = 5.67e-8, 0.85
+
+def get_h(v_kmh):
+    v_ms = abs(v_kmh) / 3.6
+    h_forced = 5.0 + 4.0 * (v_ms ** 0.8)
+    return h_forced if h_forced > 5.0 else 5.0
+
+def get_q_tr(t_tensor):
+    q_peak = 11040.0
+    val = torch.zeros_like(t_tensor)
+    mask1 = (t_tensor < 1.0) & (t_tensor >= 0.0)
+    val[mask1] = q_peak * t_tensor[mask1]
+    mask2 = (t_tensor >= 1.0) & (t_tensor <= 6.0)
+    val[mask2] = q_peak * (1.0 - (t_tensor[mask2] - 1.0) / 5.0)
+    return val
+
+# ==========================================
+# 2. الموديل (PINN)
+# ==========================================
+class BatteryPINN_Uncertainty(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 128), nn.Tanh(),
+            nn.Linear(128, 1)
+        )
+    def forward(self, t, v):
+        inputs = torch.cat([t/TIME_SCALE, v/V_SCALE], dim=1)
+        return self.net(inputs) * T_SCALE
+
+@st.cache_resource
+def load_model():
+    model = BatteryPINN_Uncertainty()
+    try:
+        model.load_state_dict(torch.load("battery_pinn_uncertainty.pth", map_location=torch.device('cpu')))
+        model.eval()
+    except:
+        pass 
+    return model
+
+# ==========================================
+# 3. المتحكم الهجين (حسابات عدم اليقين)
+# ==========================================
+class HybridController:
+    def __init__(self, ai_model, t_threshold=60.0):
+        self.ai_model = ai_model
+        self.t_threshold = t_threshold
+
+    def classical_step(self, T_curr, v_val, dt, amb_temp=T_INF):
+        h_val = get_h(v_val)
+        Q_conv = h_val * A * (T_curr - amb_temp)
+        Q_rad = EPSILON * SIGMA * A * ((T_curr + 273.15)**4 - (amb_temp + 273.15)**4)
+        dTdt = -(Q_conv + Q_rad) / (M * CP)
+        return T_curr + dTdt * dt
+
+    def solve_trajectory(self, duration_sec, v_kmh, amb_temp=23.0, n_samples=50):
+        # 1. مرحلة AI (مع عدم اليقين)
+        t_ai_limit = min(duration_sec, self.t_threshold)
+        points_ai = int(t_ai_limit * 2) if t_ai_limit > 0 else 10
+        t_ai = torch.linspace(0, t_ai_limit, points_ai).view(-1, 1)
+        v_in = torch.full_like(t_ai, v_kmh)
+        
+        self.ai_model.train() 
+        preds = []
+        with torch.no_grad():
+            for _ in range(n_samples):
+                preds.append(self.ai_model(t_ai, v_in).numpy().flatten())
+        
+        preds = np.array(preds)
+        T_ai_mean = preds.mean(axis=0) + (amb_temp - 23.0)
+        T_ai_std = preds.std(axis=0)
+        
+        if duration_sec <= self.t_threshold:
+            return t_ai.flatten().numpy(), T_ai_mean, T_ai_std
+
+        # 2. مرحلة الفيزياء (Uncertainty = 0)
+        t_phy = []
+        T_phy = []
+        T_phy_std = [] 
+        
+        curr_t = t_ai_limit
+        curr_T = T_ai_mean[-1]
+        dt = 1.0
+        
+        while curr_t < duration_sec:
+            curr_t += dt
+            curr_T = self.classical_step(curr_T, v_kmh, dt, amb_temp)
+            t_phy.append(curr_t)
+            T_phy.append(curr_T)
+            T_phy_std.append(0.0) 
+            
+        full_t = np.concatenate([t_ai.flatten().numpy(), t_phy])
+        full_T = np.concatenate([T_ai_mean, T_phy])
+        full_std = np.concatenate([T_ai_std, T_phy_std])
+        
+        return full_t, full_T, full_std
+
+# ==========================================
+# 4. المحلل ومعالجة البيانات
+# ==========================================
+def parse_and_simulate(query, agent):
+    query = query.lower()
+    
+    duration = 60.0 
+    time_str = "60s"
+    min_match = re.search(r'(\\d+)\\s*(min|minutes)', query)
+    sec_match = re.search(r'(\\d+)\\s*(s|sec|seconds)', query)
+    
+    if min_match:
+        mins = float(min_match.group(1))
+        duration = mins * 60.0
+        time_str = f"{mins} min"
+    elif sec_match:
+        secs = float(sec_match.group(1))
+        duration = secs
+        time_str = f"{secs} sec"
+        
+    velocity = 0.0
+    vel_str = "0 km/h (Static)"
+    vel_match = re.search(r'(\\d+)\\s*(km|km/h|kph)', query)
+    if vel_match:
+        velocity = float(vel_match.group(1))
+        vel_str = f"{velocity} km/h"
+        
+    amb_temp = 23.0
+    if "winter" in query or "cold" in query: amb_temp = -10.0
+    elif "desert" in query or "hot" in query: amb_temp = 45.0
+        
+    t_vals, T_vals, std_vals = agent.solve_trajectory(duration, velocity, amb_temp)
+    
+    return t_vals, T_vals, std_vals, velocity, amb_temp, time_str, vel_str
+
+# ==========================================
+# 5. واجهة المستخدم
+# ==========================================
+st.title("🔋 Ultimate Digital Twin: Data & Analytics")
+st.markdown("**Complete Engineering Analysis with Uncertainty Quantification**")
+
+model = load_model()
+agent = HybridController(model)
+
+tab1, tab2, tab3 = st.tabs(["💬 Chat Agent", "📊 Data Tables", "⚖️ Validation"])
+
+# --- Tab 1: الشات مع النتائج التفصيلية ---
+with tab1:
+    st.caption("Try: 'Simulate 20 km/h for 2 minutes'. See the uncertainty metrics below.")
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if "figure" in msg:
+                st.plotly_chart(msg["figure"], use_container_width=True)
+            if "dataframe" in msg:
+                st.dataframe(msg["dataframe"], hide_index=True)
+
+    if prompt := st.chat_input("Enter your query..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Processing..."):
+                t_sim, T_sim, std_sim, vel, amb, t_str, v_str = parse_and_simulate(prompt, agent)
+                
+                final_temp = T_sim[-1]
+                
+                # حساب أقصى شك (في منطقة الـ AI)
+                max_uncertainty = np.max(std_sim) * 2 # 95% Confidence
+                
+                # رسالة نصية بالصيغة العلمية
+                response_text = f"**Simulation:** {v_str} | {t_str} | {amb}°C\\n"
+                response_text += f"**Final Result:** {final_temp:.2f}°C"
+                
+                if max_uncertainty > 0.01:
+                    response_text += f" (Model Uncertainty: ±{max_uncertainty:.2f}°C)"
+                else:
+                    response_text += " (Deterministic Physics Regime)"
+                
+                st.markdown(response_text)
+                
+                # 1. الرسم البياني
+                fig = go.Figure()
+                x_rev = t_sim[::-1]
+                y_upper = T_sim + 2 * std_sim
+                y_lower = T_sim - 2 * std_sim
+                y_lower = y_lower[::-1]
+                
+                fig.add_trace(go.Scatter(
+                    x=np.concatenate([t_sim/60, x_rev/60]),
+                    y=np.concatenate([y_upper, y_lower]),
+                    fill='toself',
+                    fillcolor='rgba(255,0,0,0.2)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    name='Uncertainty (±2σ)'
+                ))
+                fig.add_trace(go.Scatter(x=t_sim/60, y=T_sim, mode='lines', name='Temperature', line=dict(color='#FF4B4B', width=2)))
+                if t_sim[-1] > 60:
+                    fig.add_vline(x=1.0, line_dash="dash", annotation_text="AI Limit")
+                fig.update_layout(xaxis_title="Time (Minutes)", yaxis_title="Temperature (°C)", height=350, margin=dict(t=20, b=20))
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # 2. جدول البيانات التفصيلي (الجديد!) 🆕
+                # تجميع البيانات في DataFrame
+                df = pd.DataFrame({
+                    "Time (s)": t_sim,
+                    "Temp (°C)": T_sim,
+                    "Uncertainty (±°C)": std_sim * 2, # 2 sigma
+                })
+                # حساب نسبة الشك المئوية (تجنب القسمة على صفر)
+                df["Uncertainty (%)"] = (df["Uncertainty (±°C)"] / df["Temp (°C)"].replace(0, 1)) * 100
+                
+                # تنسيق العرض
+                st.markdown("### 📋 Detailed Data Log")
+                # عرض عينة كل 10 نقاط لتخفيف الحمل إذا كانت البيانات ضخمة، أو كلها إذا قصيرة
+                display_df = df.iloc[::max(1, len(df)//20)] if len(df) > 50 else df
+                
+                st.dataframe(
+                    display_df.style.format({
+                        "Time (s)": "{:.1f}",
+                        "Temp (°C)": "{:.2f}",
+                        "Uncertainty (±°C)": "{:.4f}",
+                        "Uncertainty (%)": "{:.2f}%"
+                    }).background_gradient(subset=["Temp (°C)"], cmap="Reds"),
+                    use_container_width=True
+                )
+                
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": response_text, 
+                    "figure": fig,
+                    "dataframe": display_df # حفظ الجدول في الذاكرة
+                })
+
+# --- Tab 2: جداول مجمعة (للسيناريوهات الجاهزة) ---
+with tab2:
+    st.markdown("### 📑 Scenario Comparison Table")
+    
+    if st.button("Run Batch Analysis"):
+        scenarios = [
+            ("Winter Idle", 0.0, -10.0, 120.0),
+            ("Highway Cruise", 100.0, 25.0, 120.0),
+            ("Desert Parking", 0.0, 45.0, 120.0)
+        ]
+        
+        results = []
+        for name, v, amb, dur in scenarios:
+            _, T, std = agent.solve_trajectory(dur, v, amb)
+            peak_temp = np.max(T)
+            final_temp = T[-1]
+            avg_unc = np.mean(std) * 2
+            results.append({
+                "Scenario": name,
+                "Velocity (km/h)": v,
+                "Amb Temp (°C)": amb,
+                "Peak Temp (°C)": peak_temp,
+                "Final Temp (°C)": final_temp,
+                "Avg Uncertainty (±°C)": avg_unc
+            })
+            
+        res_df = pd.DataFrame(results)
+        st.dataframe(res_df.style.highlight_max(axis=0, subset=["Peak Temp (°C)"], color='salmon'), use_container_width=True)
+
+# --- Tab 3: التحقق ---
+with tab3:
+    st.markdown("#### ✅ Validation")
+    t_check = torch.linspace(0, 10, 1000)
+    energy_input = torch.trapz(get_q_tr(t_check), t_check).item()
+    st.metric("Integrated Heat Input", f"{energy_input/1000:.2f} kJ", "Target: ~32.2 kJ")
+"""
+
+with open("app.py", "w") as f:
+    f.write(app_code)
+
+# ==========================================
+# 3. التشغيل
+# ==========================================
+import urllib
+!pip install -q streamlit pycloudflared plotly pandas
+!wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+!chmod +x cloudflared
+!nohup ./cloudflared tunnel --url http://localhost:8501 > nohup.out 2>&1 &
+!nohup streamlit run app.py > streamlit.out 2>&1 &
+
+import time
+time.sleep(5)
+print("\n👇 LINK TO ANALYTICS DASHBOARD 👇")
+!grep -o 'https://.*\.trycloudflare.com' nohup.out 2>/dev/null | head -n 1
